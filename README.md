@@ -37,3 +37,39 @@ k8s.io/api has been patched to remove `net.ResolveUDPAddr` and `net.ListenUDP` c
 vendor/k8s.io/utils/net/port.go:116:20: undefined: net.ResolveUDPAddr
 vendor/k8s.io/utils/net/port.go:120:20: undefined: net.ListenUDP
 ```
+
+- mod http2 stub library and remove any httptrace reference
+- replace stubbed version of klog
+- vendor
+- try to compile and fix the error in the vendore libraries
+- port.go -> remove UDP case
+- other errors of embedded interfaces and constants (need to fix iota in go-stub-package)
+- stub k8s.io/apimachinery/pkg/util/net and replace it in the vendored dir
+- fix net.Roundtripper and net.Interface and other errors
+- now the linker will complain about missing reflect.unsafe_New and other symbols
+- add linkname declarations to your main.go:
+
+do not forget to import unsafe: `import _"unsafe"`
+
+```
+//go:linkname unsafe_New reflect.unsafe_New
+func unsafe_New() {}
+
+//go:linkname typedmemmove reflect.typedmemmove
+func typedmemmove() {}
+
+//go:linkname typedslicecopy reflect.typedslicecopy
+func typedslicecopy() {}
+
+//go:linkname unsafe_NewArray reflect.unsafe_NewArray
+func unsafe_NewArray() {}
+
+//go:linkname unsafe_makemap reflect.unsafe_makemap
+func unsafe_makemap() {}
+
+//go:linkname unsafe_mapassign reflect.unsafe_mapassign
+func unsafe_mapassign() {}
+```
+
+- build with `tinygo build -o policy.wasm -target=wasi -no-debug -opt 0 .`
+  the `-opt 0` flag is needed to avoid wasm-opt being called and causing errors (maybe we can tune this a bit)
