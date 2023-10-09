@@ -45,7 +45,7 @@ vendor/k8s.io/utils/net/port.go:120:20: undefined: net.ListenUDP
 - port.go -> remove UDP case
 - other errors of embedded interfaces and constants (need to fix iota in go-stub-package)
 - stub k8s.io/apimachinery/pkg/util/net and replace it in the vendored dir
-- fix net.Roundtripper and net.Interface and other errors
+- fix net.Roundtripper and net.Interface and other errors (change to type interface{})
 - now the linker will complain about missing reflect.unsafe_New and other symbols
 - add linkname declarations to your main.go:
 
