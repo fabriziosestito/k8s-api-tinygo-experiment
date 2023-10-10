@@ -1,317 +1,493 @@
-// Copyright 2014 The Go Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style
-// license that can be found in the LICENSE file.
-
-// Package http2 implements the HTTP/2 protocol.
-//
-// This package is low-level and intended to be used directly by very
-// few people. Most users will use it indirectly through the automatic
-// use by the net/http package (from Go 1.6 and later).
-// For use in earlier Go versions see ConfigureServer. (Transport support
-// requires Go 1.6 or later)
-//
-// See https://http2.github.io/ for more information on HTTP/2.
-//
-// See https://http2.golang.org/ for a test server running this code.
-package http2 // import "golang.org/x/net/http2"
+package http2
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/tls"
-	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
-	"sort"
-	"strconv"
-	"strings"
+	"net/url"
 	"sync"
+	"time"
 
-	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2/hpack"
 )
 
-var (
-	VerboseLogs    bool
-	logFrameWrites bool
-	logFrameReads  bool
-	inTests        bool
-)
+type noDialClientConnPool struct{ *clientConnPool }
 
-func init() {
-	e := os.Getenv("GODEBUG")
-	if strings.Contains(e, "http2debug=1") {
-		VerboseLogs = true
-	}
-	if strings.Contains(e, "http2debug=2") {
-		VerboseLogs = true
-		logFrameWrites = true
-		logFrameReads = true
-	}
+type ClientConnPool interface {
+	GetClientConn(req *http.Request, addr string) (*ClientConn, error)
+	MarkDead(*ClientConn)
 }
 
-const (
-	// ClientPreface is the string that must be sent by new
-	// connections from clients.
-	ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+type clientConnPool struct {
+	t            *Transport
+	mu           sync.Mutex
+	conns        map[string][]*ClientConn
+	dialing      map[string]*dialCall
+	keys         map[*ClientConn][]string
+	addConnCalls map[string]*addConnCall
+}
 
-	// SETTINGS_MAX_FRAME_SIZE default
-	// https://httpwg.org/specs/rfc7540.html#rfc.section.6.5.2
-	initialMaxFrameSize = 16384
+type addConnCall struct {
+	_    incomparable
+	p    *clientConnPool
+	done chan struct{}
+	err  error
+}
 
-	// NextProtoTLS is the NPN/ALPN protocol negotiated during
-	// HTTP/2's TLS setup.
-	NextProtoTLS = "h2"
+type clientConnPoolIdleCloser interface {
+	closeIdleConnections()
+}
 
-	// https://httpwg.org/specs/rfc7540.html#SettingValues
-	initialHeaderTableSize = 4096
+type dialCall struct {
+	_    incomparable
+	p    *clientConnPool
+	ctx  context.Context
+	done chan struct{}
+	res  *ClientConn
+	err  error
+}
 
-	initialWindowSize = 65535 // 6.9.2 Initial Flow Control Window Size
+func (p *clientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
+	panic("stub")
+}
 
-	defaultMaxReadFrameSize = 1 << 20
-)
+func (p *clientConnPool) MarkDead(cc *ClientConn) {
+	panic("stub")
+}
 
-var (
-	clientPreface = []byte(ClientPreface)
-)
+func (p noDialClientConnPool) GetClientConn(req *http.Request, addr string) (*ClientConn, error) {
+	panic("stub")
+}
+
+type dataBuffer struct {
+	chunks   [][]byte
+	r        int
+	w        int
+	size     int
+	expected int64
+}
+
+func (b *dataBuffer) Read(p []byte) (int, error) {
+	panic("stub")
+}
+
+func (b *dataBuffer) Len() int {
+	panic("stub")
+}
+
+func (b *dataBuffer) Write(p []byte) (int, error) {
+	panic("stub")
+}
+
+type duplicatePseudoHeaderError string
+
+type ErrCode uint32
+
+type connError struct {
+	Code   ErrCode
+	Reason string
+}
+
+type StreamError struct {
+	StreamID uint32
+	Code     ErrCode
+	Cause    error
+}
+
+type goAwayFlowError struct{}
+
+type pseudoHeaderError string
+
+type headerFieldNameError string
+
+type headerFieldValueError string
+
+type ConnectionError ErrCode
+
+func (e ErrCode) String() string {
+	panic("stub")
+}
+
+func (e ConnectionError) Error() string {
+	panic("stub")
+}
+
+func (e StreamError) Error() string {
+	panic("stub")
+}
+
+func (e connError) Error() string {
+	panic("stub")
+}
+
+func (e pseudoHeaderError) Error() string {
+	panic("stub")
+}
+
+func (e duplicatePseudoHeaderError) Error() string {
+	panic("stub")
+}
+
+func (e headerFieldNameError) Error() string {
+	panic("stub")
+}
+
+func (e headerFieldValueError) Error() string {
+	panic("stub")
+}
+
+type outflow struct {
+	_    incomparable
+	n    int32
+	conn *outflow
+}
+
+type inflow struct {
+	avail  int32
+	unsent int32
+}
+
+const frameHeaderLen = 9
+
+type Framer struct {
+	r                  io.Reader
+	lastFrame          Frame
+	errDetail          error
+	countError         func(errToken string)
+	lastHeaderStream   uint32
+	maxReadSize        uint32
+	headerBuf          [frameHeaderLen]byte
+	getReadBuf         func(size uint32) []byte
+	readBuf            []byte
+	maxWriteSize       uint32
+	w                  io.Writer
+	wbuf               []byte
+	AllowIllegalWrites bool
+	AllowIllegalReads  bool
+	ReadMetaHeaders    *hpack.Decoder
+	MaxHeaderListSize  uint32
+	// logReads
+	logWrites         bool
+	debugFramer       *Framer
+	debugFramerBuf    *bytes.Buffer
+	debugReadLoggerf  func(string, ...interface{})
+	debugWriteLoggerf func(string, ...interface{})
+	frameCache        *frameCache
+}
+
+type UnknownFrame struct {
+	FrameHeader
+	p []byte
+}
+
+type streamEnder interface {
+	StreamEnded() bool
+}
+
+type HeadersFrameParam struct {
+	StreamID      uint32
+	BlockFragment []byte
+	EndStream     bool
+	EndHeaders    bool
+	PadLength     uint8
+	Priority      PriorityParam
+}
+
+type WindowUpdateFrame struct {
+	FrameHeader
+	Increment uint32
+}
+
+type FrameType uint8
+
+type Frame interface {
+	Header() FrameHeader
+	invalidate()
+}
+
+type GoAwayFrame struct {
+	FrameHeader
+	LastStreamID uint32
+	ErrCode      ErrCode
+	debugData    []byte
+}
+
+type FrameHeader struct {
+	valid    bool
+	Type     FrameType
+	Flags    Flags
+	Length   uint32
+	StreamID uint32
+}
+
+type PingFrame struct {
+	FrameHeader
+	Data [8]byte
+}
+
+type MetaHeadersFrame struct {
+	*HeadersFrame
+	Fields    []hpack.HeaderField
+	Truncated bool
+}
+
+type HeadersFrame struct {
+	FrameHeader
+	Priority      PriorityParam
+	headerFragBuf []byte
+}
+
+type frameParser func(fc *frameCache, fh FrameHeader, countError func(string), payload []byte) (Frame, error)
+
+type DataFrame struct {
+	FrameHeader
+	data []byte
+}
+
+type PriorityFrame struct {
+	FrameHeader
+	PriorityParam
+}
+
+type PushPromiseFrame struct {
+	FrameHeader
+	PromiseID     uint32
+	headerFragBuf []byte
+}
+
+type SettingsFrame struct {
+	FrameHeader
+	p []byte
+}
+
+type PushPromiseParam struct {
+	StreamID      uint32
+	PromiseID     uint32
+	BlockFragment []byte
+	EndHeaders    bool
+	PadLength     uint8
+}
+
+type RSTStreamFrame struct {
+	FrameHeader
+	ErrCode ErrCode
+}
+
+type Flags uint8
+
+type frameCache struct{ dataFrame DataFrame }
+
+type ContinuationFrame struct {
+	FrameHeader
+	headerFragBuf []byte
+}
+
+type PriorityParam struct {
+	StreamDep uint32
+	Exclusive bool
+	Weight    uint8
+}
+
+type headersEnder interface {
+	HeadersEnded() bool
+}
+
+type headersOrContinuation interface {
+	HeaderBlockFragment() []byte
+}
+
+func (t FrameType) String() string {
+	panic("stub")
+}
+
+func (f Flags) Has(v Flags) bool {
+	panic("stub")
+}
+
+func (h FrameHeader) Header() FrameHeader {
+	panic("stub")
+}
+
+func (h FrameHeader) String() string {
+	panic("stub")
+}
+
+func ReadFrameHeader(r io.Reader) (FrameHeader, error) {
+	panic("stub")
+}
+
+func (fr *Framer) SetReuseFrames() {
+	panic("stub")
+}
+
+func NewFramer(w io.Writer, r io.Reader) *Framer {
+	panic("stub")
+}
+
+func (fr *Framer) SetMaxReadFrameSize(v uint32) {
+	panic("stub")
+}
+
+func (fr *Framer) ErrorDetail() error {
+	panic("stub")
+}
+
+func (fr *Framer) ReadFrame() (Frame, error) {
+	panic("stub")
+}
+
+func (f *DataFrame) StreamEnded() bool {
+	panic("stub")
+}
+
+func (f *DataFrame) Data() []byte {
+	panic("stub")
+}
+
+func (f *Framer) WriteData(streamID uint32, endStream bool, data []byte) error {
+	panic("stub")
+}
+
+func (f *Framer) WriteDataPadded(streamID uint32, endStream bool, data, pad []byte) error {
+	panic("stub")
+}
+
+func (f *SettingsFrame) IsAck() bool {
+	panic("stub")
+}
+
+func (f *SettingsFrame) Value(id SettingID) (v uint32, ok bool) {
+	panic("stub")
+}
+
+func (f *SettingsFrame) Setting(i int) Setting {
+	panic("stub")
+}
+
+func (f *SettingsFrame) NumSettings() int {
+	panic("stub")
+}
+
+func (f *SettingsFrame) HasDuplicates() bool {
+	panic("stub")
+}
+
+func (f *SettingsFrame) ForeachSetting(fn func(Setting) error) error {
+	panic("stub")
+}
+
+func (f *Framer) WriteSettings(settings ...Setting) error {
+	panic("stub")
+}
+
+func (f *Framer) WriteSettingsAck() error {
+	panic("stub")
+}
+
+func (f *PingFrame) IsAck() bool {
+	panic("stub")
+}
+
+func (f *Framer) WritePing(ack bool, data [8]byte) error {
+	panic("stub")
+}
+
+func (f *GoAwayFrame) DebugData() []byte {
+	panic("stub")
+}
+
+func (f *Framer) WriteGoAway(maxStreamID uint32, code ErrCode, debugData []byte) error {
+	panic("stub")
+}
+
+func (f *UnknownFrame) Payload() []byte {
+	panic("stub")
+}
+
+func (f *Framer) WriteWindowUpdate(streamID, incr uint32) error {
+	panic("stub")
+}
+
+func (f *HeadersFrame) HeaderBlockFragment() []byte {
+	panic("stub")
+}
+
+func (f *HeadersFrame) HeadersEnded() bool {
+	panic("stub")
+}
+
+func (f *HeadersFrame) StreamEnded() bool {
+	panic("stub")
+}
+
+func (f *HeadersFrame) HasPriority() bool {
+	panic("stub")
+}
+
+func (f *Framer) WriteHeaders(p HeadersFrameParam) error {
+	panic("stub")
+}
+
+func (p PriorityParam) IsZero() bool {
+	panic("stub")
+}
+
+func (f *Framer) WritePriority(streamID uint32, p PriorityParam) error {
+	panic("stub")
+}
+
+func (f *Framer) WriteRSTStream(streamID uint32, code ErrCode) error {
+	panic("stub")
+}
+
+func (f *ContinuationFrame) HeaderBlockFragment() []byte {
+	panic("stub")
+}
+
+func (f *ContinuationFrame) HeadersEnded() bool {
+	panic("stub")
+}
+
+func (f *Framer) WriteContinuation(streamID uint32, endHeaders bool, headerBlockFragment []byte) error {
+	panic("stub")
+}
+
+func (f *PushPromiseFrame) HeaderBlockFragment() []byte {
+	panic("stub")
+}
+
+func (f *PushPromiseFrame) HeadersEnded() bool {
+	panic("stub")
+}
+
+func (f *Framer) WritePushPromise(p PushPromiseParam) error {
+	panic("stub")
+}
+
+func (f *Framer) WriteRawFrame(t FrameType, flags Flags, streamID uint32, payload []byte) error {
+	panic("stub")
+}
+
+func (mh *MetaHeadersFrame) PseudoValue(pseudo string) string {
+	panic("stub")
+}
+
+func (mh *MetaHeadersFrame) RegularFields() []hpack.HeaderField {
+	panic("stub")
+}
+
+func (mh *MetaHeadersFrame) PseudoFields() []hpack.HeaderField {
+	panic("stub")
+}
+
+type goroutineLock uint64
 
 type streamState int
-
-// HTTP/2 stream states.
-//
-// See http://tools.ietf.org/html/rfc7540#section-5.1.
-//
-// For simplicity, the server code merges "reserved (local)" into
-// "half-closed (remote)". This is one less state transition to track.
-// The only downside is that we send PUSH_PROMISEs slightly less
-// liberally than allowable. More discussion here:
-// https://lists.w3.org/Archives/Public/ietf-http-wg/2016JulSep/0599.html
-//
-// "reserved (remote)" is omitted since the client code does not
-// support server push.
-const (
-	stateIdle streamState = iota
-	stateOpen
-	stateHalfClosedLocal
-	stateHalfClosedRemote
-	stateClosed
-)
-
-var stateName = [...]string{
-	stateIdle:             "Idle",
-	stateOpen:             "Open",
-	stateHalfClosedLocal:  "HalfClosedLocal",
-	stateHalfClosedRemote: "HalfClosedRemote",
-	stateClosed:           "Closed",
-}
-
-func (st streamState) String() string {
-	return stateName[st]
-}
-
-// Setting is a setting parameter: which setting it is, and its value.
-type Setting struct {
-	// ID is which setting is being set.
-	// See https://httpwg.org/specs/rfc7540.html#SettingFormat
-	ID SettingID
-
-	// Val is the value.
-	Val uint32
-}
-
-func (s Setting) String() string {
-	return fmt.Sprintf("[%v = %d]", s.ID, s.Val)
-}
-
-// Valid reports whether the setting is valid.
-func (s Setting) Valid() error {
-	// Limits and error codes from 6.5.2 Defined SETTINGS Parameters
-	switch s.ID {
-	case SettingEnablePush:
-		if s.Val != 1 && s.Val != 0 {
-			return ConnectionError(ErrCodeProtocol)
-		}
-	case SettingInitialWindowSize:
-		if s.Val > 1<<31-1 {
-			return ConnectionError(ErrCodeFlowControl)
-		}
-	case SettingMaxFrameSize:
-		if s.Val < 16384 || s.Val > 1<<24-1 {
-			return ConnectionError(ErrCodeProtocol)
-		}
-	}
-	return nil
-}
-
-// A SettingID is an HTTP/2 setting as defined in
-// https://httpwg.org/specs/rfc7540.html#iana-settings
-type SettingID uint16
-
-const (
-	SettingHeaderTableSize      SettingID = 0x1
-	SettingEnablePush           SettingID = 0x2
-	SettingMaxConcurrentStreams SettingID = 0x3
-	SettingInitialWindowSize    SettingID = 0x4
-	SettingMaxFrameSize         SettingID = 0x5
-	SettingMaxHeaderListSize    SettingID = 0x6
-)
-
-var settingName = map[SettingID]string{
-	SettingHeaderTableSize:      "HEADER_TABLE_SIZE",
-	SettingEnablePush:           "ENABLE_PUSH",
-	SettingMaxConcurrentStreams: "MAX_CONCURRENT_STREAMS",
-	SettingInitialWindowSize:    "INITIAL_WINDOW_SIZE",
-	SettingMaxFrameSize:         "MAX_FRAME_SIZE",
-	SettingMaxHeaderListSize:    "MAX_HEADER_LIST_SIZE",
-}
-
-func (s SettingID) String() string {
-	if v, ok := settingName[s]; ok {
-		return v
-	}
-	return fmt.Sprintf("UNKNOWN_SETTING_%d", uint16(s))
-}
-
-// validWireHeaderFieldName reports whether v is a valid header field
-// name (key). See httpguts.ValidHeaderName for the base rules.
-//
-// Further, http2 says:
-//
-//	"Just as in HTTP/1.x, header field names are strings of ASCII
-//	characters that are compared in a case-insensitive
-//	fashion. However, header field names MUST be converted to
-//	lowercase prior to their encoding in HTTP/2. "
-func validWireHeaderFieldName(v string) bool {
-	if len(v) == 0 {
-		return false
-	}
-	for _, r := range v {
-		if !httpguts.IsTokenRune(r) {
-			return false
-		}
-		if 'A' <= r && r <= 'Z' {
-			return false
-		}
-	}
-	return true
-}
-
-func httpCodeString(code int) string {
-	switch code {
-	case 200:
-		return "200"
-	case 404:
-		return "404"
-	}
-	return strconv.Itoa(code)
-}
-
-// from pkg io
-type stringWriter interface {
-	WriteString(s string) (n int, err error)
-}
-
-// A gate lets two goroutines coordinate their activities.
-type gate chan struct{}
-
-func (g gate) Done() { g <- struct{}{} }
-func (g gate) Wait() { <-g }
-
-// A closeWaiter is like a sync.WaitGroup but only goes 1 to 0 (open to closed).
-type closeWaiter chan struct{}
-
-// Init makes a closeWaiter usable.
-// It exists because so a closeWaiter value can be placed inside a
-// larger struct and have the Mutex and Cond's memory in the same
-// allocation.
-func (cw *closeWaiter) Init() {
-	*cw = make(chan struct{})
-}
-
-// Close marks the closeWaiter as closed and unblocks any waiters.
-func (cw closeWaiter) Close() {
-	close(cw)
-}
-
-// Wait waits for the closeWaiter to become closed.
-func (cw closeWaiter) Wait() {
-	<-cw
-}
-
-// bufferedWriter is a buffered writer that writes to w.
-// Its buffered writer is lazily allocated as needed, to minimize
-// idle memory usage with many connections.
-type bufferedWriter struct {
-	_  incomparable
-	w  io.Writer     // immutable
-	bw *bufio.Writer // non-nil when data is buffered
-}
-
-func newBufferedWriter(w io.Writer) *bufferedWriter {
-	return &bufferedWriter{w: w}
-}
-
-// bufWriterPoolBufferSize is the size of bufio.Writer's
-// buffers created using bufWriterPool.
-//
-// TODO: pick a less arbitrary value? this is a bit under
-// (3 x typical 1500 byte MTU) at least. Other than that,
-// not much thought went into it.
-const bufWriterPoolBufferSize = 4 << 10
-
-var bufWriterPool = sync.Pool{
-	New: func() interface{} {
-		return bufio.NewWriterSize(nil, bufWriterPoolBufferSize)
-	},
-}
-
-func (w *bufferedWriter) Available() int {
-	if w.bw == nil {
-		return bufWriterPoolBufferSize
-	}
-	return w.bw.Available()
-}
-
-func (w *bufferedWriter) Write(p []byte) (n int, err error) {
-	if w.bw == nil {
-		bw := bufWriterPool.Get().(*bufio.Writer)
-		bw.Reset(w.w)
-		w.bw = bw
-	}
-	return w.bw.Write(p)
-}
-
-func (w *bufferedWriter) Flush() error {
-	bw := w.bw
-	if bw == nil {
-		return nil
-	}
-	err := bw.Flush()
-	bw.Reset(nil)
-	bufWriterPool.Put(bw)
-	w.bw = nil
-	return err
-}
-
-func mustUint31(v int32) uint32 {
-	if v < 0 || v > 2147483647 {
-		panic("out of range")
-	}
-	return uint32(v)
-}
-
-// bodyAllowedForStatus reports whether a given response status code
-// permits a body. See RFC 7230, section 3.3.
-func bodyAllowedForStatus(status int) bool {
-	switch {
-	case status >= 100 && status <= 199:
-		return false
-	case status == 204:
-		return false
-	case status == 304:
-		return false
-	}
-	return true
-}
 
 type httpError struct {
 	_       incomparable
@@ -319,67 +495,892 @@ type httpError struct {
 	timeout bool
 }
 
-func (e *httpError) Error() string   { return e.msg }
-func (e *httpError) Timeout() bool   { return e.timeout }
-func (e *httpError) Temporary() bool { return true }
+type bufferedWriter struct {
+	_  incomparable
+	w  io.Writer
+	bw *bufio.Writer
+}
 
-var errTimeout error = &httpError{msg: "http2: timeout awaiting response headers", timeout: true}
+type incomparable [0]func()
+
+type Setting struct {
+	ID  SettingID
+	Val uint32
+}
 
 type connectionStater interface {
 	ConnectionState() tls.ConnectionState
 }
 
-var sorterPool = sync.Pool{New: func() interface{} { return new(sorter) }}
+type sorter struct{ v []string }
 
-type sorter struct {
-	v []string // owned by sorter
+type SettingID uint16
+
+type stringWriter interface {
+	WriteString(s string) (n int, err error)
 }
 
-func (s *sorter) Len() int           { return len(s.v) }
-func (s *sorter) Swap(i, j int)      { s.v[i], s.v[j] = s.v[j], s.v[i] }
-func (s *sorter) Less(i, j int) bool { return s.v[i] < s.v[j] }
+type gate chan struct{}
 
-// Keys returns the sorted keys of h.
-//
-// The returned slice is only valid until s used again or returned to
-// its pool.
+type closeWaiter chan struct{}
+
+func (st streamState) String() string {
+	panic("stub")
+}
+
+func (s Setting) String() string {
+	panic("stub")
+}
+
+func (s Setting) Valid() error {
+	panic("stub")
+}
+
+func (s SettingID) String() string {
+	panic("stub")
+}
+
+func (g gate) Done() {
+	panic("stub")
+}
+
+func (g gate) Wait() {
+	panic("stub")
+}
+
+func (cw *closeWaiter) Init() {
+	panic("stub")
+}
+
+func (cw closeWaiter) Close() {
+	panic("stub")
+}
+
+func (cw closeWaiter) Wait() {
+	panic("stub")
+}
+
+func (w *bufferedWriter) Available() int {
+	panic("stub")
+}
+
+func (w *bufferedWriter) Write(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (w *bufferedWriter) Flush() error {
+	panic("stub")
+}
+
+func (e *httpError) Error() string {
+	panic("stub")
+}
+
+func (e *httpError) Timeout() bool {
+	panic("stub")
+}
+
+func (e *httpError) Temporary() bool {
+	panic("stub")
+}
+
+func (s *sorter) Len() int {
+	panic("stub")
+}
+
+func (s *sorter) Swap(i, j int) {
+	panic("stub")
+}
+
+func (s *sorter) Less(i, j int) bool {
+	panic("stub")
+}
+
 func (s *sorter) Keys(h http.Header) []string {
-	keys := s.v[:0]
-	for k := range h {
-		keys = append(keys, k)
-	}
-	s.v = keys
-	sort.Sort(s)
-	return keys
+	panic("stub")
 }
 
 func (s *sorter) SortStrings(ss []string) {
-	// Our sorter works on s.v, which sorter owns, so
-	// stash it away while we sort the user's buffer.
-	save := s.v
-	s.v = ss
-	sort.Sort(s)
-	s.v = save
+	panic("stub")
 }
 
-// validPseudoPath reports whether v is a valid :path pseudo-header
-// value. It must be either:
-//
-//   - a non-empty string starting with '/'
-//   - the string '*', for OPTIONS requests.
-//
-// For now this is only used a quick check for deciding when to clean
-// up Opaque URLs before sending requests from the Transport.
-// See golang.org/issue/16847
-//
-// We used to enforce that the path also didn't start with "//", but
-// Google's GFE accepts such paths and Chrome sends them, so ignore
-// that part of the spec. See golang.org/issue/19103.
-func validPseudoPath(v string) bool {
-	return (len(v) > 0 && v[0] == '/') || v == "*"
+type pipe struct {
+	mu       sync.Mutex
+	c        sync.Cond
+	b        pipeBuffer
+	unread   int
+	err      error
+	breakErr error
+	donec    chan struct{}
+	readFn   func()
 }
 
-// incomparable is a zero-width, non-comparable type. Adding it to a struct
-// makes that struct also non-comparable, and generally doesn't add
-// any size (as long as it's first).
-type incomparable [0]func()
+type pipeBuffer interface {
+	Len() int
+}
+
+func (p *pipe) Len() int {
+	panic("stub")
+}
+
+func (p *pipe) Read(d []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (p *pipe) Write(d []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (p *pipe) CloseWithError(err error) {
+	panic("stub")
+}
+
+func (p *pipe) BreakWithError(err error) {
+	panic("stub")
+}
+
+func (p *pipe) Err() error {
+	panic("stub")
+}
+
+func (p *pipe) Done() chan<- struct{} {
+	panic("stub")
+}
+
+type stream struct {
+	sc               *serverConn
+	id               uint32
+	body             *pipe
+	cw               closeWaiter
+	ctx              context.Context
+	cancelCtx        func()
+	bodyBytes        int64
+	declBodyBytes    int64
+	flow             outflow
+	inflow           inflow
+	state            streamState
+	resetQueued      bool
+	gotTrailerHeader bool
+	wroteHeaders     bool
+	readDeadline     *time.Timer
+	writeDeadline    *time.Timer
+	closeErr         error
+	trailer          http.Header
+	reqTrailer       http.Header
+}
+
+type responseWriterState struct {
+	stream          *stream
+	req             *http.Request
+	conn            *serverConn
+	bw              *bufio.Writer
+	handlerHeader   http.Header
+	snapHeader      http.Header
+	trailers        []string
+	status          int
+	wroteHeader     bool
+	sentHeader      bool
+	handlerDone     bool
+	dirty           bool
+	sentContentLen  int64
+	wroteBytes      int64
+	closeNotifierMu sync.Mutex
+	closeNotifierCh chan bool
+}
+
+type serverInternalState struct {
+	mu          sync.Mutex
+	activeConns map[*serverConn]struct{}
+}
+
+type frameWriteResult struct {
+	_   incomparable
+	wr  FrameWriteRequest
+	err error
+}
+
+type requestParam struct {
+	method string
+	// scheme
+	// authority
+	path   string
+	header http.Header
+}
+
+type chunkWriter struct{ rws *responseWriterState }
+
+type startPushRequest struct {
+	parent *stream
+	method string
+	url    *url.URL
+	header http.Header
+	done   chan error
+}
+
+type Server struct {
+	MaxHandlers                  int
+	MaxConcurrentStreams         uint32
+	MaxDecoderHeaderTableSize    uint32
+	MaxEncoderHeaderTableSize    uint32
+	MaxReadFrameSize             uint32
+	PermitProhibitedCipherSuites bool
+	IdleTimeout                  time.Duration
+	MaxUploadBufferPerConnection int32
+	MaxUploadBufferPerStream     int32
+	NewWriteScheduler            func() WriteScheduler
+	CountError                   func(errType string)
+	state                        *serverInternalState
+}
+
+type serverMessage int
+
+type serverConn struct {
+	srv                         *Server
+	hs                          *http.Server
+	conn                        net.Conn
+	bw                          *bufferedWriter
+	handler                     http.Handler
+	baseCtx                     context.Context
+	framer                      *Framer
+	doneServing                 chan struct{}
+	readFrameCh                 chan readFrameResult
+	wantWriteFrameCh            chan FrameWriteRequest
+	wroteFrameCh                chan frameWriteResult
+	bodyReadCh                  chan bodyReadMsg
+	serveMsgCh                  chan interface{}
+	flow                        outflow
+	inflow                      inflow
+	tlsState                    *tls.ConnectionState
+	remoteAddrStr               string
+	writeSched                  WriteScheduler
+	serveG                      goroutineLock
+	pushEnabled                 bool
+	sawClientPreface            bool
+	sawFirstSettings            bool
+	needToSendSettingsAck       bool
+	unackedSettings             int
+	queuedControlFrames         int
+	clientMaxStreams            uint32
+	advMaxStreams               uint32
+	curClientStreams            uint32
+	curPushedStreams            uint32
+	maxClientStreamID           uint32
+	maxPushPromiseID            uint32
+	streams                     map[uint32]*stream
+	initialStreamSendWindowSize int32
+	maxFrameSize                int32
+	peerMaxHeaderListSize       uint32
+	canonHeader                 map[string]string
+	canonHeaderKeysSize         int
+	writingFrame                bool
+	writingFrameAsync           bool
+	needsFrameFlush             bool
+	inGoAway                    bool
+	inFrameScheduleLoop         bool
+	needToSendGoAway            bool
+	goAwayCode                  ErrCode
+	shutdownTimer               *time.Timer
+	idleTimer                   *time.Timer
+	headerWriteBuf              bytes.Buffer
+	hpackEncoder                *hpack.Encoder
+	shutdownOnce                sync.Once
+}
+
+type readFrameResult struct {
+	f        Frame
+	err      error
+	readMore func()
+}
+
+type responseWriter struct{ rws *responseWriterState }
+
+type bodyReadMsg struct {
+	st *stream
+	n  int
+}
+
+type requestBody struct {
+	_             incomparable
+	stream        *stream
+	conn          *serverConn
+	closeOnce     sync.Once
+	sawEOF        bool
+	pipe          *pipe
+	needsContinue bool
+}
+
+type ServeConnOpts struct {
+	Context          context.Context
+	BaseConfig       *http.Server
+	Handler          http.Handler
+	UpgradeRequest   *http.Request
+	Settings         []byte
+	SawClientPreface bool
+}
+
+func ConfigureServer(s *http.Server, conf *Server) error {
+	panic("stub")
+}
+
+func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
+	panic("stub")
+}
+
+func (sc *serverConn) Framer() *Framer {
+	panic("stub")
+}
+
+func (sc *serverConn) CloseConn() error {
+	panic("stub")
+}
+
+func (sc *serverConn) Flush() error {
+	panic("stub")
+}
+
+func (sc *serverConn) HeaderEncoder() (*hpack.Encoder, *bytes.Buffer) {
+	panic("stub")
+}
+
+func (b *requestBody) Close() error {
+	panic("stub")
+}
+
+func (b *requestBody) Read(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (cw chunkWriter) Write(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (w *responseWriter) SetReadDeadline(deadline time.Time) error {
+	panic("stub")
+}
+
+func (w *responseWriter) SetWriteDeadline(deadline time.Time) error {
+	panic("stub")
+}
+
+func (w *responseWriter) Flush() {
+	panic("stub")
+}
+
+func (w *responseWriter) FlushError() error {
+	panic("stub")
+}
+
+func (w *responseWriter) CloseNotify() chan<- bool {
+	panic("stub")
+}
+
+func (w *responseWriter) Header() http.Header {
+	panic("stub")
+}
+
+func (w *responseWriter) WriteHeader(code int) {
+	panic("stub")
+}
+
+func (w *responseWriter) Write(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (w *responseWriter) WriteString(s string) (n int, err error) {
+	panic("stub")
+}
+
+func (w *responseWriter) Push(target string, opts *http.PushOptions) error {
+	panic("stub")
+}
+
+type ClientConnState struct {
+	Closed               bool
+	Closing              bool
+	StreamsActive        int
+	StreamsReserved      int
+	StreamsPending       int
+	MaxConcurrentStreams uint32
+	LastIdle             time.Time
+}
+
+type stickyErrWriter struct {
+	conn    net.Conn
+	timeout time.Duration
+	err     *error
+}
+
+type resAndError struct {
+	_   incomparable
+	res *http.Response
+	err error
+}
+
+type clientConnReadLoop struct {
+	_  incomparable
+	cc *ClientConn
+}
+
+type errorReader struct{ err error }
+
+type erringRoundTripper struct{ err error }
+
+type noCachedConnError struct{}
+
+type clientStream struct {
+	cc                   *ClientConn
+	ctx                  context.Context
+	reqCancel            chan<- struct{}
+	trace                interface{}
+	ID                   uint32
+	bufPipe              pipe
+	requestedGzip        bool
+	isHead               bool
+	abortOnce            sync.Once
+	abort                chan struct{}
+	abortErr             error
+	peerClosed           chan struct{}
+	donec                chan struct{}
+	on100                chan struct{}
+	respHeaderRecv       chan struct{}
+	res                  *http.Response
+	flow                 outflow
+	inflow               inflow
+	bytesRemain          int64
+	readErr              error
+	reqBody              io.ReadCloser
+	reqBodyContentLength int64
+	reqBodyClosed        chan struct{}
+	sentEndStream        bool
+	sentHeaders          bool
+	firstByte            bool
+	pastHeaders          bool
+	pastTrailers         bool
+	num1xx               uint8
+	readClosed           bool
+	readAborted          bool
+	trailer              http.Header
+	resTrailer           *http.Header
+}
+
+type gzipReader struct {
+	_    incomparable
+	body io.ReadCloser
+	zr   *gzip.Reader
+	zerr error
+}
+
+type clientConnIdleState struct{ canTakeNewRequest bool }
+
+type Transport struct {
+	DialTLSContext             func(ctx context.Context, network, addr string, cfg *tls.Config) (net.Conn, error)
+	DialTLS                    func(network, addr string, cfg *tls.Config) (net.Conn, error)
+	TLSClientConfig            *tls.Config
+	ConnPool                   ClientConnPool
+	DisableCompression         bool
+	AllowHTTP                  bool
+	MaxHeaderListSize          uint32
+	MaxReadFrameSize           uint32
+	MaxDecoderHeaderTableSize  uint32
+	MaxEncoderHeaderTableSize  uint32
+	StrictMaxConcurrentStreams bool
+	ReadIdleTimeout            time.Duration
+	PingTimeout                time.Duration
+	WriteByteTimeout           time.Duration
+	CountError                 func(errType string)
+	t1                         interface{}
+	connPoolOnce               sync.Once
+	connPoolOrDef              ClientConnPool
+}
+
+type noDialH2RoundTripper struct{ *Transport }
+
+type missingBody struct{}
+
+type ClientConn struct {
+	t                      *Transport
+	tconn                  net.Conn
+	tlsState               *tls.ConnectionState
+	reused                 uint32
+	singleUse              bool
+	getConnCalled          bool
+	readerDone             chan struct{}
+	readerErr              error
+	idleTimeout            time.Duration
+	idleTimer              *time.Timer
+	mu                     sync.Mutex
+	cond                   *sync.Cond
+	flow                   outflow
+	inflow                 inflow
+	doNotReuse             bool
+	closing                bool
+	closed                 bool
+	seenSettings           bool
+	wantSettingsAck        bool
+	goAway                 *GoAwayFrame
+	goAwayDebug            string
+	streams                map[uint32]*clientStream
+	streamsReserved        int
+	nextStreamID           uint32
+	pendingRequests        int
+	pings                  map[[8]byte]chan struct{}
+	br                     *bufio.Reader
+	lastActive             time.Time
+	lastIdle               time.Time
+	maxFrameSize           uint32
+	maxConcurrentStreams   uint32
+	peerMaxHeaderListSize  uint64
+	peerMaxHeaderTableSize uint32
+	initialWindowSize      uint32
+	reqHeaderMu            chan struct{}
+	wmu                    sync.Mutex
+	bw                     *bufio.Writer
+	fr                     *Framer
+	werr                   error
+	hbuf                   bytes.Buffer
+	henc                   *hpack.Encoder
+}
+
+type transportResponseBody struct{ cs *clientStream }
+
+type RoundTripOpt struct{ OnlyCachedConn bool }
+
+type GoAwayError struct {
+	LastStreamID uint32
+	ErrCode      ErrCode
+	DebugData    string
+}
+
+type noBodyReader struct{}
+
+func ConfigureTransport(t1 interface{}) error {
+	panic("stub")
+}
+
+func ConfigureTransports(t1 interface{}) (*Transport, error) {
+	panic("stub")
+}
+
+func (sew stickyErrWriter) Write(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (t *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	panic("stub")
+}
+
+func (t *Transport) RoundTripOpt(req *http.Request, opt RoundTripOpt) (*http.Response, error) {
+	panic("stub")
+}
+
+func (t *Transport) CloseIdleConnections() {
+	panic("stub")
+}
+
+func (t *Transport) NewClientConn(c net.Conn) (*ClientConn, error) {
+	panic("stub")
+}
+
+func (cc *ClientConn) SetDoNotReuse() {
+	panic("stub")
+}
+
+func (cc *ClientConn) CanTakeNewRequest() bool {
+	panic("stub")
+}
+
+func (cc *ClientConn) ReserveNewRequest() bool {
+	panic("stub")
+}
+
+func (cc *ClientConn) State() ClientConnState {
+	panic("stub")
+}
+
+func (cc *ClientConn) Shutdown(ctx context.Context) error {
+	panic("stub")
+}
+
+func (cc *ClientConn) Close() error {
+	panic("stub")
+}
+
+func (cc *ClientConn) RoundTrip(req *http.Request) (*http.Response, error) {
+	panic("stub")
+}
+
+func (e GoAwayError) Error() string {
+	panic("stub")
+}
+
+func (b transportResponseBody) Read(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (b transportResponseBody) Close() error {
+	panic("stub")
+}
+
+func (cc *ClientConn) Ping(ctx context.Context) error {
+	panic("stub")
+}
+
+func (rt erringRoundTripper) RoundTripErr() error {
+	panic("stub")
+}
+
+func (rt erringRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	panic("stub")
+}
+
+func (gz *gzipReader) Read(p []byte) (n int, err error) {
+	panic("stub")
+}
+
+func (gz *gzipReader) Close() error {
+	panic("stub")
+}
+
+func (r errorReader) Read(p []byte) (int, error) {
+	panic("stub")
+}
+
+func (rt noDialH2RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	panic("stub")
+}
+
+type writePushPromise struct {
+	streamID           uint32
+	method             string
+	url                *url.URL
+	h                  http.Header
+	allocatePromisedID func() (uint32, error)
+	promisedID         uint32
+}
+
+type writeWindowUpdate struct {
+	streamID uint32
+	n        uint32
+}
+
+type flushFrameWriter struct{}
+
+type writeSettings []Setting
+
+type handlerPanicRST struct{ StreamID uint32 }
+
+type writeFramer interface {
+	writeFrame(writeContext) error
+	staysWithinBuffer(size int) bool
+}
+
+type writePingAck struct{ pf *PingFrame }
+
+type write100ContinueHeadersFrame struct{ streamID uint32 }
+
+type writeGoAway struct {
+	maxStreamID uint32
+	code        ErrCode
+}
+
+type writeData struct {
+	streamID  uint32
+	p         []byte
+	endStream bool
+}
+
+type writeSettingsAck struct{}
+
+type writeContext interface {
+	Framer() *Framer
+	Flush() error
+	CloseConn() error
+	HeaderEncoder() (*hpack.Encoder, *bytes.Buffer)
+}
+
+type writeResHeaders struct {
+	streamID      uint32
+	httpResCode   int
+	h             http.Header
+	trailers      []string
+	endStream     bool
+	date          string
+	contentType   string
+	contentLength string
+}
+
+func (w *writeData) String() string {
+	panic("stub")
+}
+
+type WriteScheduler interface {
+	OpenStream(streamID uint32, options OpenStreamOptions)
+	CloseStream(streamID uint32)
+	AdjustStream(streamID uint32, priority PriorityParam)
+	Push(wr FrameWriteRequest)
+	Pop() (wr FrameWriteRequest, ok bool)
+}
+
+type OpenStreamOptions struct{ PusherID uint32 }
+
+type FrameWriteRequest struct {
+	write  writeFramer
+	stream *stream
+	done   chan error
+}
+
+type writeQueue struct {
+	s []FrameWriteRequest
+	// prev
+	next *writeQueue
+}
+
+type writeQueuePool []*writeQueue
+
+func (wr FrameWriteRequest) StreamID() uint32 {
+	panic("stub")
+}
+
+func (wr FrameWriteRequest) DataSize() int {
+	panic("stub")
+}
+
+func (wr FrameWriteRequest) Consume(n int32) (FrameWriteRequest, FrameWriteRequest, int) {
+	panic("stub")
+}
+
+func (wr FrameWriteRequest) String() string {
+	panic("stub")
+}
+
+type sortPriorityNodeSiblings []*priorityNode
+
+type priorityWriteScheduler struct {
+	root  priorityNode
+	nodes map[uint32]*priorityNode
+	maxID uint32
+	// closedNodes
+	idleNodes            []*priorityNode
+	maxClosedNodesInTree int
+	maxIdleNodesInTree   int
+	writeThrottleLimit   int32
+	enableWriteThrottle  bool
+	tmp                  []*priorityNode
+	queuePool            writeQueuePool
+}
+
+type PriorityWriteSchedulerConfig struct {
+	MaxClosedNodesInTree     int
+	MaxIdleNodesInTree       int
+	ThrottleOutOfOrderWrites bool
+}
+
+type priorityNodeState int
+
+type priorityNode struct {
+	q            writeQueue
+	id           uint32
+	weight       uint8
+	state        priorityNodeState
+	bytes        int64
+	subtreeBytes int64
+	parent       *priorityNode
+	kids         *priorityNode
+	// prev
+	next *priorityNode
+}
+
+func NewPriorityWriteScheduler(cfg *PriorityWriteSchedulerConfig) WriteScheduler {
+	panic("stub")
+}
+
+func (z sortPriorityNodeSiblings) Len() int {
+	panic("stub")
+}
+
+func (z sortPriorityNodeSiblings) Swap(i, k int) {
+	panic("stub")
+}
+
+func (z sortPriorityNodeSiblings) Less(i, k int) bool {
+	panic("stub")
+}
+
+func (ws *priorityWriteScheduler) OpenStream(streamID uint32, options OpenStreamOptions) {
+	panic("stub")
+}
+
+func (ws *priorityWriteScheduler) CloseStream(streamID uint32) {
+	panic("stub")
+}
+
+func (ws *priorityWriteScheduler) AdjustStream(streamID uint32, priority PriorityParam) {
+	panic("stub")
+}
+
+func (ws *priorityWriteScheduler) Push(wr FrameWriteRequest) {
+	panic("stub")
+}
+
+func (ws *priorityWriteScheduler) Pop() (wr FrameWriteRequest, ok bool) {
+	panic("stub")
+}
+
+type randomWriteScheduler struct {
+	zero      writeQueue
+	sq        map[uint32]*writeQueue
+	queuePool writeQueuePool
+}
+
+func NewRandomWriteScheduler() WriteScheduler {
+	panic("stub")
+}
+
+func (ws *randomWriteScheduler) OpenStream(streamID uint32, options OpenStreamOptions) {
+	panic("stub")
+}
+
+func (ws *randomWriteScheduler) CloseStream(streamID uint32) {
+	panic("stub")
+}
+
+func (ws *randomWriteScheduler) AdjustStream(streamID uint32, priority PriorityParam) {
+	panic("stub")
+}
+
+func (ws *randomWriteScheduler) Push(wr FrameWriteRequest) {
+	panic("stub")
+}
+
+func (ws *randomWriteScheduler) Pop() (FrameWriteRequest, bool) {
+	panic("stub")
+}
+
+type roundRobinWriteScheduler struct {
+	control   writeQueue
+	streams   map[uint32]*writeQueue
+	head      *writeQueue
+	queuePool writeQueuePool
+}
+
+func (ws *roundRobinWriteScheduler) OpenStream(streamID uint32, options OpenStreamOptions) {
+	panic("stub")
+}
+
+func (ws *roundRobinWriteScheduler) CloseStream(streamID uint32) {
+	panic("stub")
+}
+
+func (ws *roundRobinWriteScheduler) AdjustStream(streamID uint32, priority PriorityParam) {
+	panic("stub")
+}
+
+func (ws *roundRobinWriteScheduler) Push(wr FrameWriteRequest) {
+	panic("stub")
+}
+
+func (ws *roundRobinWriteScheduler) Pop() (FrameWriteRequest, bool) {
+	panic("stub")
+}
+
+type Embedme interface{}
